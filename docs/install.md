@@ -163,12 +163,6 @@ opkg install \
 ключом репозитория OpenWrt. Зависимости (`kmod-tun`, `luci-base`, `rpcd-mod-ucode`,
 `ucode-mod-socket`, `coreutils-timeout`) менеджер подтянет из официального репозитория.
 
-## Состав выпуска
-
-Выпуск содержит только прямые пакеты (ядро и панель), единый `SHA256SUMS`, `MANIFEST.txt`,
-`install-csqtt.sh` и `uninstall-csqtt.sh`. Отдельного пакета перевода `luci-i18n-csqtt-ru`
-в выпуске нет — русский язык встроен в панель; внешних архивов `.tar.gz` и их отдельных
-`.sha256` нет.
 
 ## Удаление
 
