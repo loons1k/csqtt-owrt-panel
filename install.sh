@@ -1,6 +1,7 @@
 #!/bin/sh
 # CSQTT OpenWrt Automated Installer
-# Supports OpenWrt 23.05, 24.10, 25.12+
+# Supports OpenWrt 23.05, 24.10, 25.10.5, 25.12+
+# Tested on Huasifei WH3000Pro NAND (MT7981) + Fibocom FM350-GL
 set -e
 
 REPO_RAW="https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main"
@@ -16,7 +17,7 @@ fi
 # 2. Install dependencies
 echo "[1/5] Проверка и установка зависимостей..."
 opkg update >/dev/null 2>&1 || true
-opkg install kmod-tun curl ca-bundle ucode ucode-mod-fs ucode-mod-uci 2>/dev/null || true
+opkg install kmod-tun curl ca-bundle ucode ucode-mod-fs ucode-mod-uci gzip 2>/dev/null || true
 
 # 3. Create directories
 echo "[2/5] Создание каталогов..."
@@ -65,11 +66,18 @@ if [ ! -f /etc/config/csqtt ]; then
     curl -sSL "${REPO_RAW}/luci-app-csqtt/root/etc/config/csqtt" -o "/etc/config/csqtt"
 fi
 
-# 5. Check csqtt-core binary
-echo "[4/5] Проверка бинарного файла csqtt-core..."
-if [ ! -x /usr/bin/csqtt-core ]; then
-    ARCH="$(uname -m)"
-    echo "Предупреждение: /usr/bin/csqtt-core не найден. Установите скомпилированный бинарник csqtt-core для вашей архитектуры ($ARCH)."
+# 5. Install csqtt-core binary
+echo "[4/5] Установка бинарного ядра csqtt-core..."
+ARCH="$(uname -m)"
+if [ "$ARCH" = "aarch64" ]; then
+    echo "  -> Загрузка предсобранного csqtt-core для aarch64 (MT7981 / Cortex-A53)..."
+    curl -sSL "${REPO_RAW}/bin/csqtt-core-aarch64.gz" | gzip -d > /usr/bin/csqtt-core
+    chmod +x /usr/bin/csqtt-core
+    echo "  -> csqtt-core успешно установлен в /usr/bin/csqtt-core"
+elif [ -x /usr/bin/csqtt-core ]; then
+    echo "  -> Обнаружен существующий /usr/bin/csqtt-core"
+else
+    echo "Предупреждение: для архитектуры $ARCH соберите бинарник вручную из каталога core/."
 fi
 
 # 6. Setup cron watchdog & finalize LuCI
