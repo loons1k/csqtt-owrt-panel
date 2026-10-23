@@ -1,12 +1,18 @@
 #!/bin/sh
-# CSQTT OpenWrt Automated Installer
+# CSQTT-OWRT-Panel Automated Installer
 # Supports OpenWrt 23.05, 24.10, 25.10.5, 25.12+
 # Tested on Huasifei WH3000Pro NAND (MT7981) + Fibocom FM350-GL
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main"
+REPO_NAME="csqtt-owrt-panel"
+REPO_RAW="https://raw.githubusercontent.com/loons1k/csqtt-owrt-panel/main"
 
-echo "=== Установка CSQTT для OpenWrt ==="
+# Fallback to csqtt-openwrt if repository has not yet been renamed
+if ! curl -sfI "${REPO_RAW}/install.sh" >/dev/null 2>&1; then
+    REPO_RAW="https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main"
+fi
+
+echo "=== Установка CSQTT-OWRT-Panel для OpenWrt ==="
 
 # 1. Check root
 if [ "$(id -u)" -ne 0 ]; then
@@ -32,7 +38,7 @@ mkdir -p /etc/init.d
 mkdir -p /var/run/csqtt
 
 # 4. Download / Install LuCI components
-echo "[3/5] Установка компонентов LuCI и бэкенда..."
+echo "[3/5] Установка компонентов панели csqtt-owrt-panel..."
 LUCI_VIEWS="about.js captcha.js i18n.js i18n.ru.json logs.js profiles.js settings.js status.js tunnel.js"
 for view in $LUCI_VIEWS; do
     echo "  -> view/csqtt/$view"
@@ -92,5 +98,5 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 /etc/init.d/csqtt enable 2>/dev/null || true
 
 echo ""
-echo "=== Установка успешно завершена! ==="
+echo "=== Установка CSQTT-OWRT-Panel успешно завершена! ==="
 echo "Откройте веб-интерфейс LuCI: раздел 'Службы' -> 'CSQTT'"
