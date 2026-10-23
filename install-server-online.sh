@@ -29,7 +29,7 @@
 # =============================================================================
 set -u
 
-REPO_RAW=${CSQTT_RAW_BASE:-https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main}
+REPO_RAW=${CSQTT_RAW_BASE:-https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main}
 INSTALLER=install-server.sh
 INSTALLER_FILES='install-server.sh server/serverctl.py server/source-lock.json'
 TMP_BASE=${TMPDIR:-/tmp}

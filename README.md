@@ -75,7 +75,7 @@ CSQTT поднимает интерфейс `csqtt0` и не меняет мар
 перезапускается:
 
 ```sh
-wget --no-proxy -qO /tmp/csqtt-install.sh https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main/install-csqtt.sh \
+wget --no-proxy -qO /tmp/csqtt-install.sh https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main/install-csqtt.sh \
   && ash /tmp/csqtt-install.sh && /etc/init.d/csqtt restart
 ```
 
@@ -86,7 +86,7 @@ wget --no-proxy -qO /tmp/csqtt-install.sh https://raw.githubusercontent.com/star
 **Удаление клиента и панели:**
 
 ```sh
-wget --no-proxy -qO /tmp/csqtt-uninstall.sh https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main/uninstall-csqtt.sh \
+wget --no-proxy -qO /tmp/csqtt-uninstall.sh https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main/uninstall-csqtt.sh \
   && ash /tmp/csqtt-uninstall.sh
 ```
 
@@ -106,7 +106,7 @@ wget --no-proxy -qO /tmp/csqtt-uninstall.sh https://raw.githubusercontent.com/st
 **Установка серверной части** (`--work-dir` — рабочий каталог установщика):
 
 ```sh
-curl -fsSLo /tmp/csqtt-server.sh https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main/install-server-online.sh \
+curl -fsSLo /tmp/csqtt-server.sh https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main/install-server-online.sh \
   && sh /tmp/csqtt-server.sh --work-dir /root/csqtt-server-work/setup
 ```
 
@@ -118,7 +118,7 @@ curl -fsSLo /tmp/csqtt-server.sh https://raw.githubusercontent.com/starkugz/csqt
 **Удаление серверной части** — тот же загрузчик, режим `uninstall` установщика:
 
 ```sh
-curl -fsSLo /tmp/csqtt-server.sh https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main/install-server-online.sh \
+curl -fsSLo /tmp/csqtt-server.sh https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main/install-server-online.sh \
   && sh /tmp/csqtt-server.sh uninstall --work-dir /root/csqtt-server-work/setup
 ```
 
@@ -360,7 +360,7 @@ VK-хеши, пароли и `device_id` **сохраняются**. На вре
 Отдельно можно обновить **только ядро**, сохранив панель и настройки. **На роутере:**
 
 ```sh
-wget --no-proxy -qO /tmp/csqtt-install.sh https://raw.githubusercontent.com/starkugz/csqtt-openwrt/main/install-csqtt.sh \
+wget --no-proxy -qO /tmp/csqtt-install.sh https://raw.githubusercontent.com/loons1k/csqtt-openwrt/main/install-csqtt.sh \
   && ash /tmp/csqtt-install.sh --core-only && /etc/init.d/csqtt restart
 ```
 
@@ -443,7 +443,7 @@ csqtt log tail -n 50
   Forkop, ZeroBlock: как настроить выход через `csqtt0`, что проверено и каков
   [сетевой контракт](docs/network-contract.md) CSQTT.
 
-**Актуальный выпуск:** [github.com/starkugz/csqtt-openwrt/releases/latest](https://github.com/starkugz/csqtt-openwrt/releases/latest).
+**Репозиторий форка:** [github.com/loons1k/csqtt-openwrt](https://github.com/loons1k/csqtt-openwrt) · **Оригинал:** [github.com/starkugz/csqtt-openwrt](https://github.com/starkugz/csqtt-openwrt).
 
 **Авторство и лицензия.** Исходное ядро CSQTT и
 [исходный проект](https://github.com/amurcanov/csqtt) созданы

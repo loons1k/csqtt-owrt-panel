@@ -80,7 +80,7 @@
 # ================================================================
 set -eu
 
-REPO="starkugz/csqtt-openwrt"
+REPO="${CSQTT_REPO:-loons1k/csqtt-openwrt}"
 # Поддерживаемые архитектуры пакетов (каталоги сборки OpenWrt).
 ARCH_OK_LIST="aarch64_cortex-a53 aarch64_generic x86_64 arm_cortex-a7_neon-vfpv4"
 OW_APK="25.12"      # apk-tools 3, пакеты .apk
