@@ -24,6 +24,13 @@ PolyForm Noncommercial License 1.0.0 — полный текст в [`LICENSE`](
   недоступен, поэтому ссылка на него не приводится.
 - Атрибуция соавтора **luminescq** сохранена.
 
+## Форк loons1k (v1.1+)
+
+- Репозиторий форка: `github.com/loons1k/csqtt-openwrt` (автор форка: **loons1k**).
+- Добавлена поддержка ядра CSQTT v2.5.0+ ([amurcanov/csqtt](https://github.com/amurcanov/csqtt)) и расшифровка нового формата ссылок `csqtt://` (AES-256-GCM с `csqtt-chiper-key`).
+- В репозиторий включены исходные файлы пакета LuCI (`luci-app-csqtt`).
+- Обеспечено строгое соблюдение Hardening: все runtime-файлы, сокеты и логи хранятся в RAM (`/var/run/csqtt/` и `/tmp/`).
+
 Стороннее ядро не представлено как собственная разработка этой редакции.
 
 ## Сторонние компоненты

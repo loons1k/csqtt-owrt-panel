@@ -1,0 +1,1135 @@
+// SPDX-FileCopyrightText: 2026 amurcanov
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+//
+// [M6a] rpcd-ucode бекенд CSQTT: ubus-объект "csqtt" для LuCI (вью — M6b/M6c).
+//
+// Безопасность (контракт M6a):
+//   - все пути зашиты (таблица INSTANCES ниже); ubus-аргумент `instance`
+//     выбирает ОДИН из фиксированных наборов, но НЕ путь — произвольный путь
+//     передать нельзя;
+//   - shell НЕ получает пользовательский ввод: команда собирается из
+//     shellquote()-экранированных элементов (см. run()), ни один аргумент не
+//     подставляется сырым (это же решение использует rpcd-ucode LuCI);
+//   - пользовательский grep компилируется regexp() в try/catch и применяется
+//     внутри ucode — строка пользователя не попадает ни в один процесс;
+//   - на каждый exec — /usr/bin/timeout (пакет coreutils-timeout); на сетевой
+//     API — сокетный таймаут (ucode-mod-socket);
+//   - id профилей/challenge'ей — строгий whitelist-паттерн [A-Za-z0-9_-]+;
+//   - секреты (password, vk_js_token, device_id, vk-хеши, export-ссылки в
+//     логах) наружу не отдаются, кроме profile_export (write-ACL, по запросу).
+//
+// [M8] Портирован на ванильный OpenWrt 25.12 (ucode upstream 2023.07.11):
+//   - fs.popen с МАССИВОМ argv возвращает null (нет поддержки array-exec) —
+//     команда собирается строкой из shellquote()-элементов;
+//   - `uci show -j/--json` не существует — конфиг читается текстовым
+//     `uci show <pkg>` и разбирается в ucode (uciJson → uciShowPkg).
+//
+// [single-instance] Один экземпляр: instance "main" (по умолчанию) — csqtt0,
+// /etc/config/csqtt, /var/run/csqtt/status.json, /var/log/csqtt.log,
+// /etc/init.d/csqtt, helper :8443. Без аргумента instance используется "main" —
+// старые вызовы панели v1 продолжают работать. Устаревший instance "alt"
+// (второй экземпляр) явно отклоняется понятной ошибкой и НЕ перенаправляется
+// молча на основной сервис (DECISIONS D14).
+//
+// Пути можно переопределить env-переменными CSQTT_LUCI_* — это хук для
+// тестов (openwrt/tests/luci/run.sh); ubus-вызывающий их задать не может
+// (env наследуется от процесса rpcd, root-only).
+'use strict';
+
+import * as fs from "fs";
+import * as socket from "socket";
+
+const BIN       = getenv("CSQTT_LUCI_BIN")       || "/usr/bin/csqtt";
+const UCIBIN    = getenv("CSQTT_LUCI_UCI")       || "/sbin/uci";
+const LOGREAD   = getenv("CSQTT_LUCI_LOGREAD")   || "/sbin/logread";
+const TIMEOUT   = getenv("CSQTT_LUCI_TIMEOUT")   || "/usr/bin/timeout";
+const HELPER_HOST = getenv("CSQTT_LUCI_HELPER_HOST") || "127.0.0.1";
+
+// Единственный экземпляр. Таблица сохранена с одним ключом "main":
+// resolveInstance("alt"/"1"/"csqtt1") возвращает null → методы отдают понятную
+// ошибку и ничего не делают.
+const INSTANCES = {
+	main: {
+		key: "main",
+		ifname: "csqtt0",
+		config: getenv("CSQTT_LUCI_CONFIG")      || "/etc/config/csqtt",
+		uci:    "csqtt",
+		status: getenv("CSQTT_LUCI_STATUS")      || "/var/run/csqtt/status.json",
+		log:    getenv("CSQTT_LUCI_LOG")         || "/var/log/csqtt.log",
+		init:   getenv("CSQTT_LUCI_INIT")        || "/etc/init.d/csqtt",
+		// [Stage-4] Файл-запрос ручного повтора активной проверки доступа:
+		// демон замечает новый mtime на тике здоровья (дедуп — один запрос).
+		accessRequest: getenv("CSQTT_LUCI_ACCESS_REQ") || "/var/run/csqtt/access-check.request",
+		// [STAGE-5 rev2] Файл-запрос ручного повтора индивидуальной проверки
+		// VK-хешей: демон замечает новый mtime на тике здоровья (тот же
+		// паттерн, что и accessRequest; дедуп — одна проверка на (сессия, набор)).
+		hashRequest: getenv("CSQTT_LUCI_HASH_REQ") || "/var/run/csqtt/hash-check.request",
+		helperPort: int(getenv("CSQTT_LUCI_HELPER_PORT") || "8443"),
+	},
+};
+
+const EXEC_TMO   = 10;    // секунд на exec службы CSQTT/doctor/service
+const HASH_TMO   = 60;    // секунд на доп.валидацию VK-хешей (сетевые VK API)
+const NET_TMO    = 3000;  // мс на connect/recv loopback API
+const LINES_MAX  = 2000;
+const LINES_DEF  = 100;
+
+// [SHARED_SETTINGS] Порядок и состав общих полей (совпадает с
+// scripts/migrate-shared-settings.sh, SHARED_SETTINGS.md §2/§3). Используется
+// только для legacy-детекции в панели: значения НЕ читаются и НЕ отдаются.
+const SHARED_FIELDS = ["vk", "vk_js_token", "vk_hash_mode", "vk_auth_mode",
+	"workers", "obfs", "turn_transport", "captcha_mode", "fingerprint",
+	"client_ids", "device_id"];
+// Скрипт миграции (пакет luci-app-csqtt, root/usr/libexec/csqtt). Путь/аргументы
+// — константы; ubus-аргументы в shell не попадают. Переопределяется только для
+// тестов (CSQTT_LUCI_MIGRATE), root-процессом rpcd.
+const MIGRATE_SCRIPT = getenv("CSQTT_LUCI_MIGRATE") || "/usr/libexec/csqtt/migrate-shared-settings.sh";
+
+const ID_RE      = regexp("^[A-Za-z0-9_-]+$");
+// [M8] section id профиля по правилам uci.rs — БЕЗ дефиса (challenge-id
+// остаётся на ID_RE). Иначе валидация расходится и LuCI пускает id, который
+// потом отклоняет Rust ("id секции: только [A-Za-z0-9_]").
+const PROFILE_ID_RE = regexp("^[A-Za-z0-9_]+$");
+const TRAIL_NL   = regexp("[\r\n]+$");
+const SERVICE_ACTIONS = ["start", "stop", "restart"];
+const PROFILE_ACTIONS = ["use", "auto", "enable", "disable", "remove"];
+
+// [Stage-3B] Диагностический бандл: только безопасные поля. Секретные ключи
+// вырезаются, а строковые значения очищаются рекурсивно (sanitizeValue):
+// URL, query-параметры токенов, IPv4 и host:port маскируются. Серверные
+// адреса (health_target, peer) в бандл не включаются. Бандл НЕ отправляется
+// автоматически.
+const MAIN_SAFE = ["enabled", "ifname", "selection_mode", "active_profile",
+	"failover", "failback", "health_mode", "captcha_policy",
+	"vk_auth_mode", "log_level", "log_file"];
+const DIAG_PROFILE_SAFE = ["name", "enabled", "priority", "workers", "obfs",
+	"turn_transport", "captcha_mode", "fingerprint", "note"];
+// Ключи, которые вырезаются на любом уровне (подстрока, регистр не важен).
+const SECRET_KEY_RE = regexp("password|passwd|secret|token|api_key|device_id|call_id|vk_hash|vk_hashes", "i");
+// [Stage-3B] Ограничения размера бандла и чтения журнала.
+const DIAG_PROFILES_MAX = 64;
+const DIAG_LOG_TAIL_LINES = 200;
+const DIAG_LOG_MAX_BYTES = 262144;      // последние 256 КиБ журнала
+const DIAG_MAX_BUNDLE_BYTES = 524288;   // общий предел сериализованного бандла
+// [Stage-3B] Маскирование в строках: URL целиком, пары key=value с секретами,
+// IPv4/IPv6 и host:port (домен/IP с портом).
+const URL_RE = regexp("[a-z][a-z0-9+.-]*://[^[:space:]]+", "ig");
+const IPV4_RE = regexp("([0-9]{1,3}\\.){3}[0-9]{1,3}", "g");
+const HOSTPORT_RE = regexp("[a-z0-9_-]+(\\.[a-z0-9_-]+)+:[0-9]{1,5}", "ig");
+// [DIAG-FIX E4] IPv6 маскируется отдельно от IPv4: POSIX ERE без lookahead,
+// поэтому покрываем явные формы — bracketed `[addr]`/`[addr]:port`, полную
+// (8 групп) и сжатую (`::`) запись. Простой `HH:MM:SS` не имеет `::` и не
+// состоит из 8 групп, поэтому метки времени не маскируются.
+const BIPV6_RE = regexp("\\[[0-9A-Fa-f:]{2,}\\](:[0-9]{1,5})?", "g");
+const IPV6_FULL_RE = regexp("([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}", "g");
+const IPV6_RE = regexp("([0-9A-Fa-f]{1,4}:)+:[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4})*", "g");
+const IPV6_LEAD_RE = regexp("::[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*", "g");
+const SECRET_PAIR_RE = regexp("(password|passwd|token|access_token|refresh_token|vk_js_token|vk_hash|vk_hashes|device_id|session_token|success_token|call_id|api_key|secret|signature|sig)=[^&[:space:]]+", "ig");
+
+// --- утилиты ---------------------------------------------------------------
+
+// Пояснение к отказу на устаревший/неизвестный instance (единая формулировка).
+const INSTANCE_ERR = "instance: поддерживается только \"main\" (второй экземпляр удалён)";
+
+// instance: принимается только "main"/""/0 (обратная совместимость панели v1).
+// Устаревший "alt"/"1"/"csqtt1" и любое неизвестное значение → null (отказ),
+// без неявного выбора основного сервиса.
+function resolveInstance(name) {
+	if (name == null || name == "" || name == "main" || name == "0" || name == 0)
+		return INSTANCES.main;
+	return null;
+}
+
+function isId(s) {
+	return (type(s) == "string" && match(s, ID_RE) != null);
+}
+
+// id секции профиля: правила uci.rs — [A-Za-z0-9_] (без дефиса). [M8]
+function isProfileId(s) {
+	return (type(s) == "string" && match(s, PROFILE_ID_RE) != null);
+}
+
+// shellquote — POSIX-безопасное экранирование одного argv-элемента (та же
+// реализация, что в rpcd-ucode LuCI: одиночные кавычки + '\'' для апострофа).
+// Именно это не даёт пользовательским строкам (name/link/id) выйти за пределы
+// своего аргумента, хотя popen исполняется интерпретатором.
+function shellquote(s) {
+	return "'" + replace("" + s, "'", "'\\''") + "'";
+}
+
+// exec-хелпер: /usr/bin/timeout <tmo> <argv...>; возвращает {code, out}.
+// [M8] Строковая форма popen (array-popen отсутствует в ucode 2023.07.11);
+// каждый элемент экранирован shellquote — сырой ввод в shell не попадает.
+function run(argv, tmo) {
+	let cmd = shellquote(TIMEOUT) + " " + shellquote("" + (tmo != null ? tmo : EXEC_TMO));
+	for (let i = 0; i < length(argv); i++)
+		cmd += " " + shellquote("" + argv[i]);
+	// [M8] CLI пишет часть ошибок в stderr; без `2>&1` LuCI показывал только
+	// «ERROR (code N)» без причины (напр. «конфиг после импорта невалиден»).
+	let p = fs.popen(cmd + " 2>&1", "r");
+	if (p == null)
+		return { code: -1, out: "" };
+	// fs.proc не поддерживает read("*a") — читаем построчно до EOF.
+	let out = "", line;
+	while ((line = p.read("line")) != null)
+		out += line;
+	let code = p.close();
+	return { code: code, out: out };
+}
+
+function strip(s) {
+	return trim(replace(s, TRAIL_NL, ""));
+}
+
+function readStatusJson(inst) {
+	let txt;
+	try {
+		txt = fs.readfile(inst.status);
+	} catch (e) {
+		return null;
+	}
+	if (txt == null)
+		return null;
+	try {
+		return json(txt);
+	} catch (e) {
+		return null;
+	}
+}
+
+function tailLines(lines, n) {
+	if (n <= 0 || length(lines) <= n)
+		return lines;
+	let out = [];
+	for (let i = length(lines) - n; i < length(lines); i++)
+		push(out, lines[i]);
+	return out;
+}
+
+// [Stage-3B] Очистка строки от секретов и адресов: URL целиком, пары
+// `key=value` с секретными ключами, IPv4, IPv6 (bracketed/полная/сжатая) и
+// host:port маскируются на `***`.
+function redactText(s) {
+	if (type(s) != "string")
+		return s;
+	s = replace(s, URL_RE, "***");
+	s = replace(s, SECRET_PAIR_RE, "***");
+	s = replace(s, BIPV6_RE, "***");
+	s = replace(s, IPV6_FULL_RE, "***");
+	s = replace(s, IPV6_RE, "***");
+	s = replace(s, IPV6_LEAD_RE, "***");
+	s = replace(s, HOSTPORT_RE, "***");
+	return replace(s, IPV4_RE, "***");
+}
+
+// [Stage-3B] Рекурсивная очистка значения: секретные ключи вырезаются, строки
+// прогоняются через redactText. Работает для вложенных объектов и массивов.
+function sanitizeValue(v) {
+	if (type(v) == "array") {
+		let out = [];
+		for (let i = 0; i < length(v); i++)
+			push(out, sanitizeValue(v[i]));
+		return out;
+	}
+	if (type(v) == "object" && v != null) {
+		let out = {};
+		for (let k in v) {
+			if (match(k, SECRET_KEY_RE) != null)
+				continue;
+			out[k] = sanitizeValue(v[k]);
+		}
+		return out;
+	}
+	return redactText(v);
+}
+
+// [Stage-3B] Модель устройства для отчёта поддержке; null, если недоступна.
+function readDeviceModel() {
+	let paths = ["/proc/device-tree/model", "/etc/openwrt_release"];
+	for (let i = 0; i < length(paths); i++) {
+		let txt;
+		try {
+			txt = fs.readfile(paths[i]);
+		} catch (e) {
+			txt = null;
+		}
+		if (txt != null && trim(txt) != "")
+			return trim(split(replace(txt, TRAIL_NL, ""), "\n")[0]);
+	}
+	return null;
+}
+
+// [Stage-3B] Хвост журнала с ОГРАНИЧЕННЫМ потреблением памяти: файл читается
+// потоково (chunk 16 КиБ), в памяти удерживаются только последние
+// DIAG_LOG_MAX_BYTES байт. Возвращает { lines, truncated, ok }.
+function readLogTail(path, n) {
+	let f;
+	try {
+		f = fs.open(path, "r");
+	} catch (e) {
+		f = null;
+	}
+	if (f == null)
+		return { lines: [], truncated: false, ok: false };
+	let keep = "", total = 0, chunk;
+	while ((chunk = f.read(16384)) != null) {
+		if (length(chunk) == 0)
+			break;
+		total += length(chunk);
+		keep += chunk;
+		if (length(keep) > DIAG_LOG_MAX_BYTES)
+			keep = substr(keep, length(keep) - DIAG_LOG_MAX_BYTES, DIAG_LOG_MAX_BYTES);
+	}
+	f.close();
+	let truncated = (total > DIAG_LOG_MAX_BYTES);
+	let parts = split(keep, "\n");
+	let lines = [];
+	for (let i = 0; i < length(parts); i++)
+		if (!(i == length(parts) - 1 && parts[i] == ""))
+			push(lines, parts[i]);
+	let from = 0;
+	if (truncated && length(lines) > 0)
+		from = 1;              // первая строка обрезана посередине
+	if (length(lines) - from > n)
+		from = length(lines) - n;
+	let out = [];
+	for (let i = from; i < length(lines); i++)
+		push(out, redactText(lines[i]));
+	return { lines: out, truncated: truncated, ok: true };
+}
+
+// Фильтр по пользовательскому регэкспу (case-insensitive). null — если
+// регэксп скомпилировать не удалось (сигнализирует ошибку вызывающему).
+function grepLines(lines, pattern) {
+	if (pattern == null || pattern == "")
+		return lines;
+	let re;
+	try {
+		re = regexp(pattern, "i");
+	} catch (e) {
+		return null;
+	}
+	let out = [];
+	for (let i = 0; i < length(lines); i++)
+		if (match(lines[i], re) != null)
+			push(out, lines[i]);
+	return out;
+}
+
+// Минимальный HTTP-клиент loopback API (helper, M4e). Возвращает
+// {ok, status, body} или {ok:false, error}.
+function apiHttp(port, method, path) {
+	let s;
+	try {
+		s = socket.connect(HELPER_HOST, port, null, NET_TMO);
+	} catch (e) {
+		return { ok: false, error: "helper API недоступен" };
+	}
+	if (s == null)
+		return { ok: false, error: "helper API недоступен" };
+	try {
+		s.send(method + " " + path + " HTTP/1.1\r\nHost: " + HELPER_HOST +
+			"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+		let buf = "", c;
+		while ((c = s.recv(4096)) && length(c) > 0)
+			buf += c;
+		s.close();
+		let sep = index(buf, "\r\n\r\n");
+		if (sep < 0)
+			return { ok: false, error: "некорректный ответ helper API" };
+		let st = 0;
+		let m = match(substr(buf, 0, sep), regexp("^HTTP/[0-9.]+ ([0-9]{3})"));
+		if (m != null)
+			st = int(m[1]);
+		return { ok: true, status: st, body: substr(buf, sep + 4) };
+	} catch (e) {
+		try { s.close(); } catch (e2) {}
+		return { ok: false, error: "ошибка helper API: " + e };
+	}
+}
+
+function parseJson(text) {
+	try {
+		return json(text);
+	} catch (e) {
+		return null;
+	}
+}
+
+// --- методы ubus-объекта "csqtt" -------------------------------------------
+
+function mStatus(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { error: INSTANCE_ERR };
+	let r = run([BIN, "status", "--json", "--status-path", inst.status], EXEC_TMO);
+	let st = (r.out != "") ? parseJson(r.out) : null;
+	return {
+		instance: inst.key,
+		code: r.code,                 // 0=connected, 1=not connected, 2=not running
+		running: r.code != 2,
+		connected: r.code == 0,
+		status: (st != null ? st : {}),
+	};
+}
+
+function mLogs(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { error: INSTANCE_ERR, lines: [] };
+	let a = req.args;
+	let source = (a.source != null ? a.source : "file");
+	let n = (a.lines != null ? a.lines : LINES_DEF);
+	if (n < 1) n = 1;
+	if (n > LINES_MAX) n = LINES_MAX;
+
+	let lines = [];
+	if (source == "syslog") {
+		// procd пишет stdout/stderr сервиса с тегом имени сервиса (csqtt).
+		// [M8] logread-ubox не поддерживает `-n` — хвост ограничиваем сами.
+		let r = run([LOGREAD, "-e", "csqtt"], EXEC_TMO);
+		if (r.code != 0 && r.out == "")
+			return { error: "logread вернул код " + r.code, lines: [] };
+		lines = split(replace(r.out, TRAIL_NL, ""), "\n");
+	} else if (source == "file") {
+		let txt;
+		try {
+			txt = fs.readfile(inst.log);
+		} catch (e) {
+			return { error: "лог-файл недоступен", lines: [] };
+		}
+		if (txt == null)
+			return { error: "лог-файл не найден", lines: [] };
+		lines = split(replace(txt, TRAIL_NL, ""), "\n");
+	} else {
+		return { error: "source: file|syslog", lines: [] };
+	}
+
+	lines = tailLines(lines, n);
+	if (a.grep != null && a.grep != "") {
+		let filtered = grepLines(lines, a.grep);
+		if (filtered == null)
+			return { error: "некорректный регэксп в grep", lines: [] };
+		lines = filtered;
+	}
+	return { instance: inst.key, source: source, count: length(lines), lines: lines };
+}
+
+function mLogsClear(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let size = 0;
+	let st = null;
+	try {
+		st = fs.stat(inst.log);
+	} catch (e) {}
+	if (st != null)
+		size = st.size;
+	let f;
+	try {
+		f = fs.open(inst.log, "w");   // truncate-to-zero, права сохраняются
+	} catch (e) {
+		return { ok: false, error: "не удалось очистить лог" };
+	}
+	if (f == null)
+		return { ok: false, error: "не удалось очистить лог" };
+	f.close();
+	return { ok: true, instance: inst.key, cleared_bytes: size };
+}
+
+function mService(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let action = req.args.action;
+	let allowed = false;
+	for (let i = 0; i < length(SERVICE_ACTIONS); i++)
+		if (SERVICE_ACTIONS[i] == action)
+			allowed = true;
+	if (!allowed)
+		return { ok: false, error: "action: start|stop|restart" };
+	let r = run([inst.init, action], EXEC_TMO);
+	return { ok: r.code == 0, instance: inst.key, action: action, code: r.code };
+}
+
+// [Stage-4] Ручной повтор активной проверки доступа из панели. Сама проверка
+// выполняется ТОЛЬКО демоном (привязка к csqtt0, один запрос на сессию):
+// rpcd лишь обновляет файл-запрос, который драйвер замечает на тике здоровья
+// (дедуп по mtime — опросы и несколько вкладок не размножают проверки).
+// Сетевых запросов отсюда нет; секретов нет.
+function mAccessCheck(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let f;
+	try {
+		f = fs.open(inst.accessRequest, "w");
+	} catch (e) {
+		return { ok: false, error: "не удалось запросить проверку" };
+	}
+	if (f == null)
+		return { ok: false, error: "не удалось запросить проверку" };
+	try {
+		f.write("" + time() + "\n");
+	} catch (e) {}
+	f.close();
+	return { ok: true, instance: inst.key };
+}
+
+// [STAGE-5 rev2] Ручной повтор индивидуальной проверки VK-хешей из панели.
+// Сама проверка выполняется ТОЛЬКО демоном (один запуск на (сессия, набор),
+// manual-режим; в auto_js/auto_api вызовов не создаётся): rpcd лишь обновляет
+// файл-запрос, который драйвер замечает на тике здоровья (дедуп по mtime —
+// опросы и несколько вкладок не размножают проверки). Результат ложится в
+// status.json без переподключения. Сетевых запросов отсюда нет; секретов нет.
+function mHashRecheck(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let f;
+	try {
+		f = fs.open(inst.hashRequest, "w");
+	} catch (e) {
+		return { ok: false, error: "не удалось запросить проверку" };
+	}
+	if (f == null)
+		return { ok: false, error: "не удалось запросить проверку" };
+	try {
+		f.write("" + time() + "\n");
+	} catch (e) {}
+	f.close();
+	return { ok: true, instance: inst.key };
+}
+
+// Разворачивание значения из `uci show` (одиночные кавычки; '\'' → ').
+function uciUnquote(v) {
+	if (length(v) >= 2 && substr(v, 0, 1) == "'" && substr(v, length(v) - 1, 1) == "'")
+		v = substr(v, 1, length(v) - 2);
+	return replace(v, "'\\''", "'");
+}
+
+// [M8] `uci show -j` на ванильном OpenWrt нет — читаем текстовый
+// `uci show <pkg>` и собираем {section: {".type", opt: val, ...}} в ucode.
+function uciShowPkg(pkg) {
+	let r = run([UCIBIN, "show", pkg], EXEC_TMO);
+	if (r.code != 0)
+		return null;
+	let prefix = pkg + ".";
+	let cfg = {};
+	let lines = split(replace(r.out, TRAIL_NL, ""), "\n");
+	for (let i = 0; i < length(lines); i++) {
+		let ln = lines[i];
+		if (substr(ln, 0, length(prefix)) != prefix)
+			continue;
+		ln = substr(ln, length(prefix));
+		let eq = index(ln, "=");
+		if (eq < 0)
+			continue;
+		let key = substr(ln, 0, eq), val = substr(ln, eq + 1);
+		let dot = index(key, ".");
+		if (dot < 0) {
+			if (cfg[key] == null)
+				cfg[key] = {};
+			cfg[key][".type"] = val;
+		} else {
+			let sec = substr(key, 0, dot), opt = substr(key, dot + 1);
+			if (cfg[sec] == null)
+				cfg[sec] = {};
+			cfg[sec][opt] = uciUnquote(val);
+		}
+	}
+	return cfg;
+}
+
+function mTestConf(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let r = run([BIN, "doctor", "--json", "--config", inst.config,
+		"--status-path", inst.status], EXEC_TMO);
+	let report = (r.out != "") ? parseJson(r.out) : null;
+	return {
+		ok: r.code == 0,
+		instance: inst.key,
+		code: r.code,                 // 0=OK, 1=WARN, 2=FAIL (контракт doctor)
+		report: (report != null ? report : {}),
+	};
+}
+
+// [Stage-3B] Единый диагностический бандл для поддержки. Только безопасные
+// поля: версия/устройство/безопасные параметры/статус/результаты doctor/хвост
+// журнала. Секреты, device_id и токены не включаются; статус очищается
+// рекурсивно, журнал — построчно. Скачивается вручную, автоматически не
+// отправляется.
+function mDiag(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let notes = [];
+	let bundle = {
+		kind: "csqtt-diagnostics",
+		schema: 1,
+		instance: inst.key,
+		version: null,
+		device: null,
+		config: {},
+		profiles: [],
+		status: null,
+		doctor: null,
+		log_tail: [],
+		log_truncated: false,
+		notes: notes,
+		complete: true,
+	};
+	let vr = run([BIN, "version"], EXEC_TMO);
+	if (vr.code == 0 && trim(vr.out) != "")
+		bundle.version = redactText(strip(vr.out));
+	else
+		push(notes, "version недоступна");
+
+	let dev = readDeviceModel();
+	if (dev != null)
+		bundle.device = redactText(dev);
+	else
+		push(notes, "устройство не определено");
+
+	let cfg = uciShowPkg(inst.uci);
+	if (cfg == null) {
+		push(notes, "параметры UCI недоступны");
+	} else {
+		let safe = {};
+		let main = cfg.main;
+		if (main != null) {
+			for (let i = 0; i < length(MAIN_SAFE); i++) {
+				let k = MAIN_SAFE[i];
+				if (main[k] != null)
+					safe[k] = "" + main[k];
+			}
+		}
+		bundle.config = sanitizeValue(safe);
+		let count = 0;
+		for (let id in cfg) {
+			let sec = cfg[id];
+			if (sec == null || sec[".type"] != "server")
+				continue;
+			if (count >= DIAG_PROFILES_MAX) {
+				push(notes, "список профилей усечён");
+				break;
+			}
+			count++;
+			let p = { id: id };
+			for (let i = 0; i < length(DIAG_PROFILE_SAFE); i++) {
+				let k = DIAG_PROFILE_SAFE[i];
+				if (sec[k] != null)
+					p[k] = "" + sec[k];
+			}
+			push(bundle.profiles, sanitizeValue(p));
+		}
+	}
+
+	let sr = run([BIN, "status", "--json", "--status-path", inst.status], EXEC_TMO);
+	let st = (sr.out != "") ? parseJson(sr.out) : null;
+	if (st != null)
+		bundle.status = sanitizeValue(st);
+	else
+		push(notes, "status недоступен или повреждён");
+
+	let dr = run([BIN, "doctor", "--json", "--config", inst.config,
+		"--status-path", inst.status], EXEC_TMO);
+	let rep = (dr.out != "") ? parseJson(dr.out) : null;
+	if (rep != null)
+		bundle.doctor = sanitizeValue(rep);
+	else
+		push(notes, "проверка doctor не отработала (код " + dr.code + ")");
+
+	let log = readLogTail(inst.log, DIAG_LOG_TAIL_LINES);
+	bundle.log_tail = log.lines;
+	bundle.log_truncated = log.truncated;
+	if (!log.ok)
+		push(notes, "журнал недоступен");
+	else if (log.truncated)
+		push(notes, "журнал усечён (последние " + (DIAG_LOG_MAX_BYTES / 1024) + " КиБ)");
+
+	bundle.complete = (length(notes) == 0);
+	// Общий предел: при превышении оставляем только безопасные параметры,
+	// профили и обрезанный журнал, а тяжёлые status/doctor отбрасываем.
+	let text = sprintf("%.J", bundle);
+	if (length(text) > DIAG_MAX_BUNDLE_BYTES) {
+		bundle.status = null;
+		bundle.doctor = null;
+		bundle.log_tail = [];
+		bundle.log_truncated = true;
+		push(notes, "отчёт усечён из-за размера");
+		bundle.complete = false;
+	}
+	return { ok: true, instance: inst.key, bundle: bundle };
+}
+
+// Профили из UCI: только safe-поля; секреты вырезаются явно.
+// [M6c] добавлены note/captcha_mode (не секреты; нужны вью profiles.js).
+const PROFILE_SAFE = ["name", "enabled", "priority", "peer", "workers",
+	"obfs", "turn_transport", "captcha_mode", "fingerprint", "note"];
+
+function mProfiles(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { error: INSTANCE_ERR, profiles: [] };
+	let cfg = uciShowPkg(inst.uci);
+	if (cfg == null)
+		return { error: "uci show " + inst.uci + " недоступен", instance: inst.key, selection_mode: "", active_profile: "", profiles: [] };
+	let out = [];
+	let main = cfg.main;
+	for (let id in cfg) {
+		let sec = cfg[id];
+		if (sec == null || sec[".type"] != "server")
+			continue;
+		let p = { id: id };
+		for (let i = 0; i < length(PROFILE_SAFE); i++) {
+			let k = PROFILE_SAFE[i];
+			if (sec[k] != null)
+				p[k] = "" + sec[k];
+		}
+		push(out, p);
+	}
+	// [SHARED_SETTINGS] Legacy-детекция для панели: schema_version и СПИСОК имён
+	// общих полей, которые ещё лежат в профилях и отсутствуют в main. Значения
+	// полей (в т.ч. секреты) наружу не передаются — только имена.
+	let schema_version = (main != null && main.schema_version != null) ? "" + main.schema_version : "";
+	let legacy_shared = [];
+	for (let i = 0; i < length(SHARED_FIELDS); i++) {
+		let k = SHARED_FIELDS[i];
+		if (main != null && main[k] != null && main[k] != "")
+			continue;
+		for (let id in cfg) {
+			let sec = cfg[id];
+			if (sec == null || sec[".type"] != "server")
+				continue;
+			if (sec[k] != null && sec[k] != "") {
+				push(legacy_shared, k);
+				break;
+			}
+		}
+	}
+	return {
+		instance: inst.key,
+		ifname: inst.ifname,
+		selection_mode: (main != null && main.selection_mode != null ? "" + main.selection_mode : ""),
+		active_profile: (main != null && main.active_profile != null ? "" + main.active_profile : ""),
+		schema_version: schema_version,
+		legacy_shared: legacy_shared,
+		profiles: out,
+	};
+}
+
+function mProfileAction(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let action = req.args.action;
+	let id = req.args.id;
+	let allowed = false;
+	for (let i = 0; i < length(PROFILE_ACTIONS); i++)
+		if (PROFILE_ACTIONS[i] == action)
+			allowed = true;
+	if (!allowed)
+		return { ok: false, error: "action: use|auto|enable|disable|remove" };
+	let argv = [BIN, "profile", action];
+	if (action != "auto") {
+		if (!isProfileId(id))
+			return { ok: false, error: "некорректный id профиля (только [A-Za-z0-9_])" };
+		push(argv, id);
+	}
+	push(argv, "--config"); push(argv, inst.config);
+	let r = run(argv, EXEC_TMO);
+	if (r.code != 0)
+		return { ok: false, instance: inst.key, code: r.code, output: strip(r.out) };
+	// [STAGE-10] `profile use|auto|enable|disable|remove` меняют конфиг через
+	// бинарник и сами демон не перезагружают. Без reload изменение оставалось
+	// только на диске: панель показывала новый режим/активный профиль, а
+	// работающий демон продолжал прежний выбор (кнопка «Подключить» не
+	// подключала, «Приоритет» откатывался при ближайшем reload). SIGHUP —
+	// плавное применение выбора без разрыва, как обещает подсказка кнопки.
+	let rl = run([inst.init, "reload"], EXEC_TMO);
+	return { ok: true, instance: inst.key, code: r.code, output: strip(r.out),
+		applied: rl.code == 0 };
+}
+
+function mProfileImport(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let a = req.args;
+	if (type(a.link) != "string" || substr(a.link, 0, 8) != "csqtt://")
+		return { ok: false, error: "link должен быть csqtt://…" };
+	if (length(a.link) > 4096)
+		return { ok: false, error: "link слишком длинный" };
+	let argv = [BIN, "profile", "import", a.link];
+	if (a.id != null && a.id != "") {
+		if (!isProfileId(a.id))
+			return { ok: false, error: "некорректный id (только [A-Za-z0-9_])" };
+		push(argv, "--id"); push(argv, a.id);
+	}
+	if (a.name != null && a.name != "") {
+		if (match(a.name, regexp("^[A-Za-z0-9 _.-]{1,64}$")) == null)
+			return { ok: false, error: "недопустимые символы в name" };
+		push(argv, "--name"); push(argv, a.name);
+	}
+	if (a.activate)
+		push(argv, "--activate");
+	if (a.vk_to_shared)
+		push(argv, "--vk-to-shared");
+	if (a.commit)
+		push(argv, "--commit");
+	push(argv, "--config"); push(argv, inst.config);
+	let r = run(argv, EXEC_TMO);
+	return { ok: r.code == 0, instance: inst.key, code: r.code, output: strip(r.out) };
+}
+
+// [FIX-EXPORT] CLI пишет на stderr предупреждение «ссылка содержит пароль…», а
+// run() намеренно склеивает stdout+stderr (для видимых ошибок). Поэтому из
+// вывода берём ТОЛЬКО строку-ссылку: иначе в панель попадёт «внимание…\ncsqtt://…»
+// и импорт этой же ссылки отвергнет её (round-trip export→import ломался).
+function firstLinkLine(s) {
+	let lines = split(replace(s, TRAIL_NL, ""), "\n");
+	for (let i = 0; i < length(lines); i++) {
+		let ln = trim(lines[i]);
+		if (substr(ln, 0, 8) == "csqtt://")
+			return ln;
+	}
+	return "";
+}
+
+// Экспорт возвращает csqtt://-ссылку с секретом — только write-ACL, LuCI
+// не должен показывать её без явного действия пользователя.
+function mProfileExport(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	if (!isProfileId(req.args.id))
+		return { ok: false, error: "некорректный id профиля" };
+	let r = run([BIN, "profile", "export", req.args.id, "--config", inst.config], EXEC_TMO);
+	if (r.code != 0)
+		return { ok: false, instance: inst.key, code: r.code, error: strip(r.out) };
+	let link = firstLinkLine(r.out);
+	if (link == "")
+		return { ok: false, instance: inst.key, code: r.code,
+			error: (strip(r.out) != "" ? strip(r.out) : "пустой ответ экспорта") };
+	return { ok: true, instance: inst.key, link: link };
+}
+
+// [STAGE-8-FIXES] Валидация VK-хешей: `csqtt --validate-vk-hashes`.
+// Хеши — секрет, поэтому НЕ передаём их в argv: пишем во временный файл 0600 и
+// передаём CLI путь, затем удаляем файл. Наружу отдаём только номер («Хеш №N»),
+// статус и код — без значения хеша и его фрагментов.
+//
+// Что подтверждает результат: `valid` = ссылка распознана и анонимные учётные
+// данные получены (это НЕ подтверждение передачи трафика через туннель);
+// `captcha` = VK требует CAPTCHA (не «недействительный хеш»); `invalid` =
+// фатальная ошибка ссылки; `unavailable` = сеть/сервис, результат неизвестен.
+let __hashFileSeq = 0;
+
+// [STAGE-8-FIXES-2] Временный файл с секретом создаётся атомарно и только 0600:
+//   - fs.open("wx") = O_CREAT|O_EXCL: существующий файл ИЛИ symlink по этому
+//     пути не открывается и не перезаписывается (open возвращает null) — нет
+//     подмены через symlink и нет гонки «проверил → создал»;
+//   - третий аргумент 384 (0600) задаёт права уже в момент создания (ucode
+//     вызывает open(2) с perm; umask не может понизить 0600);
+//   - имя = time() + монотонный счётчик; при редком EEXIST берётся следующее
+//     имя (до 8 попыток) — коллизии между проверками исключены, даже в /tmp.
+function openHashTemp() {
+	for (let i = 0; i < 8; i++) {
+		__hashFileSeq++;
+		let path = "/tmp/.csqtt-vkhash-" + time() + "-" + __hashFileSeq + ".tmp";
+		let f = fs.open(path, "wx", 384);
+		if (f != null)
+			return { path: path, file: f };
+	}
+	return null;
+}
+
+// Закрыть дескриптор и удалить файл (идемпотентно). Вызывается на всех путях:
+// успех, ошибка записи/exec и таймаут (timeout — обычный код возврата run()).
+function removeHashTemp(tmp, f) {
+	if (f != null) {
+		try { f.close(); } catch (e) {}
+	}
+	if (tmp != null) {
+		try { fs.unlink(tmp); } catch (e) {}
+	}
+}
+
+// [STAGE-8-FIXES-2] Не более одной проверки одновременно (кнопка блокируется
+// и в UI). Секрет не остаётся на диске ни при одном исходе.
+let __hashBusy = false;
+
+function mHashesValidate(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	if (__hashBusy)
+		return { ok: false, error: "проверка хешей уже выполняется" };
+	let a = req.args;
+	let vk = (type(a.vk) == "string") ? strip(a.vk) : "";
+	if (vk == "") {
+		if (!isProfileId(a.id))
+			return { ok: false, error: "нужен vk или корректный id профиля" };
+		let ur = run([UCIBIN, "get", inst.uci + "." + a.id + ".vk"], EXEC_TMO);
+		if (ur.code != 0)
+			return { ok: false, error: "не удалось прочитать vk профиля" };
+		vk = strip(ur.out);
+	}
+	if (vk == "")
+		return { ok: true, total: 0, valid: 0, captcha: 0, invalid: 0, unavailable: 0, hashes: [] };
+	if (length(vk) > 8192)
+		return { ok: false, error: "vk слишком длинный" };
+	__hashBusy = true;
+	let tmp = null, fh = null, r = null;
+	try {
+		let opened = openHashTemp();
+		if (opened == null) {
+			__hashBusy = false;
+			return { ok: false, error: "не удалось создать временный файл" };
+		}
+		tmp = opened.path;
+		fh = opened.file;
+		fh.write(vk);
+		fh.close();
+		fh = null;
+		r = run([BIN, "--validate-vk-hashes", "--vk-file", tmp], HASH_TMO);
+	} catch (e) {
+		removeHashTemp(tmp, fh);
+		__hashBusy = false;
+		return { ok: false, error: "ошибка проверки хешей" };
+	}
+	removeHashTemp(tmp, fh);
+	__hashBusy = false;
+	if (r == null)
+		return { ok: false, error: "не удалось выполнить проверку" };
+	let hashes = [], valid = 0, captcha = 0, invalid = 0, unavailable = 0, idx = 0;
+	let lines = split(replace(r.out, TRAIL_NL, ""), "\n");
+	for (let i = 0; i < length(lines); i++) {
+		let pos = index(lines[i], "HASH_CHECK:");
+		if (pos < 0)
+			continue;
+		let obj = parseJson(substr(lines[i], pos + 11));
+		if (obj == null)
+			continue;
+		let status = (obj.status != null ? "" + obj.status : "unknown");
+		if (status == "valid")
+			valid++;
+		else if (status == "captcha")
+			captcha++;
+		else if (status == "unavailable")
+			unavailable++;
+		else
+			invalid++;
+		push(hashes, {
+			index: idx,
+			status: status,
+			code: (obj.code != null ? obj.code : 0),
+			message: (obj.message != null ? "" + obj.message : ""),
+		});
+		idx++;
+	}
+	return {
+		ok: true, instance: inst.key, code: r.code,
+		total: idx, valid: valid, captcha: captcha, invalid: invalid, unavailable: unavailable,
+		hashes: hashes,
+	};
+}
+
+// [SHARED_SETTINGS SS-3] Миграция общих настроек через проверенный скрипт
+// SS-2 (dry-run/предпросмотр — preview; запись с backup/rollback — apply).
+// Путь скрипта и аргументы — константы, ubus-ввод в shell не попадает.
+// Скрипт по контракту не печатает секретов, поэтому вывод можно показывать.
+function mSharedMigratePreview(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let r = run(["sh", MIGRATE_SCRIPT, "--target", inst.config], EXEC_TMO);
+	return { ok: r.code == 0, instance: inst.key, code: r.code, apply: false, output: strip(r.out) };
+}
+
+function mSharedMigrateApply(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let r = run(["sh", MIGRATE_SCRIPT, "--target", inst.config, "--apply"], EXEC_TMO);
+	return { ok: r.code == 0, instance: inst.key, code: r.code, apply: true, output: strip(r.out) };
+}
+
+function mCaptchaList(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { error: INSTANCE_ERR, challenges: [] };
+	let st = readStatusJson(inst);
+	if (st == null)
+		return { instance: inst.key, running: false, captcha_pending: 0, challenges: [], profiles_required: [] };
+	let ch = [];
+	let list = (st.captcha_challenges != null ? st.captcha_challenges : []);
+	for (let i = 0; i < length(list); i++) {
+		let c = list[i];
+		if (c.state == "solved")
+			continue;
+		push(ch, {
+			id: c.id, profile: c.profile_id, mode: c.mode, state: c.state,
+			created_at: c.created_at, expires_at: c.expires_at,
+		});
+	}
+	let pr = [];
+	let profs = (st.profiles != null ? st.profiles : []);
+	for (let i = 0; i < length(profs); i++)
+		if (profs[i].state == "captcha_required")
+			push(pr, { id: profs[i].id, name: profs[i].name });
+	return {
+		instance: inst.key,
+		running: true,
+		captcha_pending: (st.captcha_pending != null ? st.captcha_pending : 0),
+		challenges: ch,
+		profiles_required: pr,
+	};
+}
+
+function mCaptchaCancel(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	if (!isId(req.args.id))
+		return { ok: false, error: "некорректный id challenge" };
+	let r = apiHttp(inst.helperPort, "POST", "/api/challenge/" + req.args.id + "/cancel");
+	if (!r.ok)
+		return { ok: false, error: r.error };
+	let body = parseJson(r.body);
+	if (r.status == 200 && body != null && body.cancelled == true)
+		return { ok: true, instance: inst.key, cancelled: true };
+	if (r.status == 404)
+		return { ok: false, error: "challenge не найден" };
+	if (r.status == 409)
+		return { ok: false, error: "challenge уже закрыт" };
+	return { ok: false, error: "helper API: HTTP " + r.status };
+}
+
+// [M6d] Прокидывает существующий M4e-эндпоинт GET /api/challenge/<id>/helper-url.
+// Ответ несёт одноразовую capability (bearer-секрет) — поэтому метод в ACL только
+// write (прецедент profile_export), а сам helper API слушает только loopback.
+function mCaptchaHelperUrl(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	if (!isId(req.args.id))
+		return { ok: false, error: "некорректный id challenge" };
+	let r = apiHttp(inst.helperPort, "GET", "/api/challenge/" + req.args.id + "/helper-url");
+	if (!r.ok)
+		return { ok: false, error: r.error };
+	let body = parseJson(r.body);
+	if (r.status == 200 && body != null && body.url != null)
+		return { ok: true, instance: inst.key, id: (body.id != null ? body.id : req.args.id), url: body.url };
+	if (r.status == 404)
+		return { ok: false, error: "capability-запись не найдена или просрочена" };
+	return { ok: false, error: "helper API: HTTP " + r.status };
+}
+
+function mCaptchaHelperInfo(req) {
+	let inst = resolveInstance(req.args.instance);
+	if (inst == null)
+		return { ok: false, error: INSTANCE_ERR };
+	let r = apiHttp(inst.helperPort, "GET", "/api/challenges");
+	let st = readStatusJson(inst);
+	let info = {
+		instance: inst.key,
+		endpoint: "http://" + HELPER_HOST + ":" + inst.helperPort,
+		port: inst.helperPort,
+		reachable: (r.ok && r.status == 200),
+		helper_running: (st != null),
+		captcha_pending: (st != null && st.captcha_pending != null ? st.captcha_pending : 0),
+	};
+	if (!info.reachable)
+		info.error = (st == null)
+			? "служба CSQTT не запущена"
+			: (r.error != null ? r.error : "служба Web Helper не отвечает");
+	return info;
+}
+
+// --- сигнатура для rpcd-ucode ----------------------------------------------
+
+return {
+	csqtt: {
+		status: {
+			args: { instance: "main" },
+			call: mStatus,
+		},
+		logs: {
+			args: { source: "file", lines: 32, grep: "", instance: "main" },
+			call: mLogs,
+		},
+		logs_clear: {
+			args: { instance: "main" },
+			call: mLogsClear,
+		},
+		service: {
+			args: { action: "", instance: "main" },
+			call: mService,
+		},
+		access_check: {
+			args: { instance: "main" },
+			call: mAccessCheck,
+		},
+		hash_recheck: {
+			args: { instance: "main" },
+			call: mHashRecheck,
+		},
+		test_conf: {
+			args: { instance: "main" },
+			call: mTestConf,
+		},
+		diag: {
+			args: { instance: "main" },
+			call: mDiag,
+		},
+		profiles: {
+			args: { instance: "main" },
+			call: mProfiles,
+		},
+		profile_action: {
+			args: { action: "", id: "", instance: "main" },
+			call: mProfileAction,
+		},
+		profile_import: {
+			args: { link: "", id: "", name: "", activate: false, vk_to_shared: false, commit: false, instance: "main" },
+			call: mProfileImport,
+		},
+		profile_export: {
+			args: { id: "", instance: "main" },
+			call: mProfileExport,
+		},
+		hashes_validate: {
+			args: { id: "", vk: "", instance: "main" },
+			call: mHashesValidate,
+		},
+		shared_migrate_preview: {
+			args: { instance: "main" },
+			call: mSharedMigratePreview,
+		},
+		shared_migrate_apply: {
+			args: { instance: "main" },
+			call: mSharedMigrateApply,
+		},
+		captcha_list: {
+			args: { instance: "main" },
+			call: mCaptchaList,
+		},
+		captcha_cancel: {
+			args: { id: "", instance: "main" },
+			call: mCaptchaCancel,
+		},
+		captcha_helper_url: {
+			args: { id: "", instance: "main" },
+			call: mCaptchaHelperUrl,
+		},
+		captcha_helper_info: {
+			args: { instance: "main" },
+			call: mCaptchaHelperInfo,
+		},
+	},
+};

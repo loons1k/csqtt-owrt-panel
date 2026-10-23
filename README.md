@@ -1,4 +1,12 @@
-# CSQTT OpenWrt
+# CSQTT OpenWrt (Fork)
+
+> [!NOTE]
+> **Это форк проекта [starkugz/csqtt-openwrt](https://github.com/starkugz/csqtt-openwrt).**  
+> **Ключевые доработки в форке:**
+> * Поддержка нового формата ссылок `csqtt://` из ядра **CSQTT v2.5.0+** ([amurcanov/csqtt](https://github.com/amurcanov/csqtt)) с шифрованием AES-256-GCM (`csqtt-chiper-key`).
+> * Обратная совместимость с открытыми ссылками v2 (`connect?v=2...`) и legacy-ссылками.
+> * В репозиторий добавлены открытые исходники пакета панели `luci-app-csqtt` (JS-контроллеры, ucode rpcd-модуль, ACL).
+> * Требования **Hardening**: все временные файлы, сокеты, vk_pool и логи изолированы в RAM (`/var/run/csqtt/` и `/tmp/`), исключая износ NAND-флеш роутера.
 
 **CSQTT** подключает роутер на OpenWrt к серверу CSQTT и позволяет управлять подключением
 через веб-интерфейс LuCI на русском языке.
@@ -18,10 +26,7 @@ CSQTT поднимает интерфейс `csqtt0` и не меняет мар
 - Нужен собственный сервер — [инструкция для VPS](docs/server.md).
 - Готовые команды для копирования — [быстрые команды](#быстрые-команды-установка-и-удаление).
 
-**[Скачать последнюю версию](https://github.com/starkugz/csqtt-openwrt/releases/latest)**
-· [Все выпуски](https://github.com/starkugz/csqtt-openwrt/releases)
-
-**Выпуск `v1.0` · панель LuCI `1.0-r1` · интеграционный пакет `csqtt` `1.0-r2` · ядро CSQTT `2.1.9` (базовый upstream-номер; сборка содержит локальные исправления и не совпадает с официальным `2.1.9` побайтово).**
+**Оригинальный проект:** [starkugz/csqtt-openwrt](https://github.com/starkugz/csqtt-openwrt) · **Апстрим ядра CSQTT:** [amurcanov/csqtt](https://github.com/amurcanov/csqtt)
 
 <details>
 <summary><strong>Скриншоты панели</strong></summary>
