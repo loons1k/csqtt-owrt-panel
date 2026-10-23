@@ -1,14 +1,13 @@
 include $(TOPDIR)/rules.mk
 
-LUCI_TITLE:=LuCI support for CSQTT VPN
-LUCI_DEPENDS:=+csqtt +luci-base +ucode +ucode-mod-fs +ucode-mod-uci
+LUCI_TITLE:=LuCI support for CSQTT (VK/OK Video Call UDP Tunnel)
+LUCI_DEPENDS:=+luci-base +kmod-tun +curl +ca-bundle +ucode +ucode-mod-fs +ucode-mod-uci
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-csqtt
-PKG_VERSION:=1.1.0
+PKG_VERSION:=2.5.0
 PKG_RELEASE:=1
-PKG_LICENSE:=PolyForm-Noncommercial-1.0.0
-PKG_MAINTAINER:=loons1k <loons1k@gmail.com>
+PKG_LICENSE:=MIT
 
 include $(TOPDIR)/feeds/luci/luci.mk
 

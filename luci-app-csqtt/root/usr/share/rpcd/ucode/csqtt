@@ -358,21 +358,8 @@ function parseJson(text) {
 
 // --- методы ubus-объекта "csqtt" -------------------------------------------
 
-function mStatus(req) {
-	let inst = resolveInstance(req.args.instance);
-	if (inst == null)
-		return { error: INSTANCE_ERR };
-	let r = run([BIN, "status", "--json", "--status-path", inst.status], EXEC_TMO);
-	let st = (r.out != "") ? parseJson(r.out) : null;
-	return {
-		instance: inst.key,
-		code: r.code,                 // 0=connected, 1=not connected, 2=not running
-		running: r.code != 2,
-		connected: r.code == 0,
-		status: (st != null ? st : {}),
-	};
+function mStatus(req) {	let inst = resolveInstance(req.args.instance);	if (inst == null)		return { error: INSTANCE_ERR };	let txt = null;	try {		txt = fs.readfile(inst.status);	} catch (e) {}	let st = (txt != null && txt != "") ? parseJson(txt) : null;	let running = (st != null && st.daemon_state == "running");	let connected = (st != null && st.connectivity && st.connectivity.session_established == true);	let code = connected ? 0 : (running ? 1 : 2);	return {		instance: inst.key,		code: code,		running: running,		connected: connected,		status: (st != null ? st : {}),	};
 }
-
 function mLogs(req) {
 	let inst = resolveInstance(req.args.instance);
 	if (inst == null)

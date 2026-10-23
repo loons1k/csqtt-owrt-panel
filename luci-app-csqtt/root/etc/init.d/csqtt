@@ -1,113 +1,77 @@
 #!/bin/sh /etc/rc.common
-# SPDX-FileCopyrightText: 2026 amurcanov
-# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-# [M5] Init-скрипт CSQTT для OpenWrt (procd). Конфиг — UCI /etc/config/csqtt.
-#
-# [single-instance] Один процесс ядра: TUN csqtt0, UCI /etc/config/csqtt,
-# runtime /var/run/csqtt/status.json, журнал /var/log/csqtt.log, helper-порт
-# 8443. Второго экземпляра (csqtt1) нет — двухэкземплярная архитектура
-# заменена (docs/panel-upgrade/DECISIONS.md D14).
-#
-# ПРИНЦИП ИЗОЛЯЦИИ: скрипт не выполняет и не регистрирует команд маршрути-
-# зации, адресации, DNS и локальной защиты — контракт M3X: interface-only,
-# route/rule/таблицы не нужны; служба CSQTT (M4b) их не ставит.
+# SPDX-FileCopyrightText: 2026 amurcanov / SkyPass
+# CSQTT 2.5.0 procd init script for OpenWrt
 
-# shellcheck disable=SC2034  # START/STOP/USE_PROCD читает /etc/rc.common, не этот скрипт
 START=99
 STOP=15
 USE_PROCD=1
 
-# Production-значения — константы контракта; переопределение окружением
-# используется только интеграционным тестом openwrt/tests/openwrt/run.sh.
-CSQTT_BIN="${CSQTT_BIN:-/usr/bin/csqtt}"
-
-# Имя procd-сервиса. Остановка/reload адресуются по имени сервиса, а не по
-# имени бинарника (иначе сигнал/остановка не привязаны к процессу точно).
-CSQTT_PROG=csqtt
-CSQTT_UCI="${CSQTT_UCI:-/etc/config/csqtt}"
-CSQTT_STATUS="${CSQTT_STATUS:-/var/run/csqtt/status.json}"
-CSQTT_LOG="${CSQTT_LOG:-/var/log/csqtt.log}"
-CSQTT_HELPER_PORT="${CSQTT_HELPER_PORT:-8443}"
-# [High-2 AUDIT] Runtime-каталог status.json: /var/run — tmpfs, на свежей
-# загрузке каталога нет — создаём до старта службы CSQTT (идемпотентно).
-CSQTT_RUN_DIR="${CSQTT_RUN_DIR:-/var/run/csqtt}"
+CSQTT_BIN="/usr/bin/csqtt-core"
+CSQTT_PROG="csqtt"
+CSQTT_RUN_DIR="/var/run/csqtt"
+CSQTT_STATUS="/var/run/csqtt/status.json"
 
 start_service() {
-	# Защита от дублирующего запуска — структурная: сервис `csqtt` описывает
-	# ровно один инстанс с фиксированным именем `main`; procd адресует
-	# инстансы по имени, поэтому повторный `start` обновляет тот же инстанс и
-	# не может поднять второй процесс. Отдельная проверка `procd_running`
-	# здесь НЕ ставится: `set` с пустым списком инстансов остановил бы уже
-	# запущенный сервис (procd service.c: vlist_flush → instance_stop).
-	# Проверка «запущен ли» уместна только в reload_service (read-only).
-
 	if [ ! -x "$CSQTT_BIN" ]; then
-		echo "csqtt: $CSQTT_BIN не найден или не исполняемый" >&2
-		return 1
-	fi
-	if [ ! -f "$CSQTT_UCI" ]; then
-		echo "csqtt: нет конфига $CSQTT_UCI (шаблон — в пакете, etc/config/csqtt)" >&2
+		echo "csqtt: $CSQTT_BIN not found or not executable" >&2
 		return 1
 	fi
 
-	# [High-2 AUDIT] Гарантированный runtime-каталог до первой записи
-	# status.json (0755: каталог читают rpcd/LuCI; секретов там нет).
-	# Сбой mkdir не блокирует туннель — служба CSQTT создаёт каталог сам и
-	# продолжит попытки (write_status_atomic), ошибка видна в логе.
-	if ! mkdir -p "$CSQTT_RUN_DIR" 2>/dev/null; then
-		echo "csqtt: не удалось создать $CSQTT_RUN_DIR — status.json может быть недоступен" >&2
-	else
-		chmod 755 "$CSQTT_RUN_DIR" 2>/dev/null
+	local enabled active_prof peer password workers obfs turn_transport vk tun_mtu ifname
+	enabled=$(uci -q get csqtt.main.enabled || echo 1)
+	if [ "$enabled" = "0" ]; then
+		echo "csqtt: service disabled in config" >&2
+		return 0
 	fi
 
-	# TUN-модуль ядра (только загрузка модуля; сеть не трогается)
+	active_prof=$(uci -q get csqtt.main.active_profile || echo profile1)
+	peer=$(uci -q get csqtt.${active_prof}.peer)
+	password=$(uci -q get csqtt.${active_prof}.password)
+	workers=$(uci -q get csqtt.${active_prof}.workers || uci -q get csqtt.main.workers || echo 10)
+	obfs=$(uci -q get csqtt.${active_prof}.obfs || uci -q get csqtt.main.obfs || echo video)
+	turn_transport=$(uci -q get csqtt.${active_prof}.turn_transport || uci -q get csqtt.main.turn_transport || echo udp)
+	vk=$(uci -q get csqtt.main.vk)
+	tun_mtu=$(uci -q get csqtt.main.tun_mtu || echo 1300)
+	ifname=$(uci -q get csqtt.main.ifname || echo csqtt0)
+
+	if [ -z "$peer" ] || [ -z "$password" ]; then
+		echo "csqtt: profile $active_prof missing peer or password" >&2
+		return 1
+	fi
+
+	mkdir -p "$CSQTT_RUN_DIR" 2>/dev/null
+	chmod 755 "$CSQTT_RUN_DIR" 2>/dev/null
 	[ -e /dev/net/tun ] || modprobe tun 2>/dev/null
 
-	# Ворота старта: csqtt doctor (read-only). exit 2 (FAIL: конфиг/ TUN) —
-	# лог + отказ; exit 1 (WARN: peer молчит, leftover <ifname>, rp_filter) —
-	# стартуем, служба CSQTT и failover-пул разберутся сами.
-	"$CSQTT_BIN" doctor --config "$CSQTT_UCI" --status-path "$CSQTT_STATUS"
-	doctor_rc=$?
-	if [ "$doctor_rc" -ge 2 ]; then
-		echo "csqtt: doctor завершился с кодом $doctor_rc — запуск отменён" >&2
-		return 1
-	fi
-
 	procd_open_instance main
-	procd_set_param command "$CSQTT_BIN" run --config "$CSQTT_UCI" \
-		--status "$CSQTT_STATUS" --log "$CSQTT_LOG" --helper-port "$CSQTT_HELPER_PORT"
+	procd_set_param command "$CSQTT_BIN" \
+		--peer "$peer" \
+		--vk "$vk" \
+		--workers "$workers" \
+		--obfs "$obfs" \
+		--turn-transport "$turn_transport" \
+		--tun "$ifname" \
+		--tun-mtu "$tun_mtu"
+	procd_set_param env CSQTT_PASSWORD="$password"
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param limits core="0 0"
+	procd_set_param file /etc/config/csqtt
 	procd_close_instance
 }
 
-# Авто-reload после коммита UCI-конфига (без stop/start, туннель не рвётся).
-# Триггер привязан к имени сервиса.
+stop_service() {
+	local ifname
+	ifname=$(uci -q get csqtt.main.ifname || echo csqtt0)
+	rm -f "$CSQTT_STATUS" "${CSQTT_STATUS}.tmp"
+	ip link del dev "$ifname" 2>/dev/null || true
+}
+
 service_triggers() {
 	procd_add_reload_trigger "$CSQTT_PROG"
 }
 
-# [M4b] служба CSQTT слушает SIGHUP и сама перечитывает UCI-конфиг — reload_service
-# только шлёт сигнал своему procd-сервису (stop/start НЕ делает).
 reload_service() {
-	if procd_running "$CSQTT_PROG"; then
-		procd_send_signal "$CSQTT_PROG" "" HUP
-	else
-		echo "csqtt: служба $CSQTT_PROG не запущена — SIGHUP пропущен" >&2
-		return 1
-	fi
-}
-
-# /etc/init.d/csqtt status -> csqtt status --status-path <status.json>
-# (exit 0 подключён / 1 нет / 2 служба CSQTT не запущена)
-status_service() {
-	"$CSQTT_BIN" status --status-path "$CSQTT_STATUS"
-}
-
-# /etc/init.d/csqtt doctor -> полная диагностика (read-only)
-extra_command "doctor" "Проверка конфига и окружения (csqtt doctor)"
-doctor() {
-	"$CSQTT_BIN" doctor --config "$CSQTT_UCI" --status-path "$CSQTT_STATUS"
+	stop
+	start
 }
